@@ -1,4 +1,4 @@
-# DevOps Pipeline — Spring Boot on AWS
+# DevOps Pipeline
 
 A production-ready DevOps pipeline for a Spring Boot application, featuring:
 Jenkins CI/CD • Docker containerisation • Terraform IaC on AWS • Prometheus/Grafana monitoring
