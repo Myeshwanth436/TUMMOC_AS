@@ -1,0 +1,231 @@
+pipeline {
+    agent any
+
+    environment {
+        APP_NAME        = 'demo-app'
+        AWS_REGION      = 'us-east-1'
+        AWS_ACCOUNT_ID  = credentials('AWS_ACCOUNT_ID')
+        ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        IMAGE_NAME      = "${ECR_REGISTRY}/${APP_NAME}"
+        IMAGE_TAG       = "${env.BUILD_NUMBER}-${env.GIT_COMMIT?.take(7) ?: 'local'}"
+        EC2_HOST        = credentials('EC2_HOST')
+        SSH_KEY         = credentials('EC2_SSH_KEY')
+        TRIVY_SEVERITY  = 'HIGH,CRITICAL'
+        TRIVY_EXIT_CODE = '1'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+    }
+
+    stages {
+
+        // ── 1. CHECKOUT ───
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "Building commit: ${env.GIT_COMMIT}"
+            }
+        }
+
+        // ── 2. LINT ───
+        stage('Lint') {
+            steps {
+                dir('app') {
+                    sh 'chmod +x gradlew'
+                    sh './gradlew checkstyleMain checkstyleTest --no-daemon'
+                }
+            }
+            post {
+                always {
+                    recordIssues(tools: [checkStyle(pattern: 'app/build/reports/checkstyle/*.xml')])
+                }
+            }
+        }
+
+        // ── 3. TEST ───
+        stage('Test') {
+            steps {
+                dir('app') {
+                    sh './gradlew test jacocoTestReport --no-daemon'
+                }
+            }
+            post {
+                always {
+                    junit 'app/build/test-results/test/*.xml'
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'app/build/reports/jacoco/test/html',
+                        reportFiles: 'index.html',
+                        reportName: 'Code Coverage'
+                    ])
+                }
+            }
+        }
+
+        // ── 4. DOCKER BUILD ────
+        // Build locally first so Trivy can scan BEFORE anything is pushed.
+        stage('Docker Build') {
+            steps {
+                sh """
+                    docker build \
+                        -f docker/Dockerfile \
+                        -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                        -t ${IMAGE_NAME}:latest \
+                        .
+                """
+            }
+        }
+
+        // ── 5. TRIVY IMAGE SCAN 
+        // Requires Trivy installed on the Jenkins agent.
+        // Install: https://aquasecurity.github.io/trivy/latest/getting-started/installation/
+        //
+        // Two Trivy invocations:
+        //   • exit-code 0  → JSON report (always written, archived as artefact)
+        //   • exit-code 1  → Table report (fails the stage on HIGH/CRITICAL CVEs)
+        //
+        // The pipeline only reaches ECR push if this stage passes.
+        stage('Trivy Image Scan') {
+            steps {
+                script {
+                    sh 'mkdir -p trivy-reports'
+
+                    // JSON report — archived for auditing / security tooling
+                    sh """
+                        trivy image \
+                            --exit-code 0 \
+                            --severity ${TRIVY_SEVERITY} \
+                            --no-progress \
+                            --format json \
+                            --output trivy-reports/trivy-report.json \
+                            ${IMAGE_NAME}:${IMAGE_TAG}
+                    """
+
+                    // Table report — human-readable in the console log
+                    // exit-code 1 here is what gates the pipeline
+                    sh """
+                        trivy image \
+                            --exit-code ${TRIVY_EXIT_CODE} \
+                            --severity ${TRIVY_SEVERITY} \
+                            --no-progress \
+                            --format table \
+                            ${IMAGE_NAME}:${IMAGE_TAG}
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-reports/trivy-report.json', allowEmptyArchive: true
+                }
+                failure {
+                    echo """
+╔══════════════════════════════════════════════════════════════╗
+║  Trivy found HIGH/CRITICAL vulnerabilities — push blocked.   ║
+║  Review trivy-reports/trivy-report.json in build artefacts.  ║
+║  Fix the CVEs or pin a patched base image, then re-run.      ║ 
+╚══════════════════════════════════════════════════════════════╝
+                    """
+                }
+            }
+        }
+
+        // ── 6. PUSH TO ECR ──
+        // Only reached when Trivy passes (no HIGH/CRITICAL CVEs).
+        // Requires the Jenkins agent IAM role (or AWS_CREDENTIALS secret) to have:
+        //   ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability,
+        //   ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload,
+        //   ecr:PutImage, ecr:DescribeRepositories, ecr:CreateRepository
+        stage('Push to ECR') {
+            steps {
+                script {
+                    withAWS(region: "${AWS_REGION}", credentials: 'AWS_CREDENTIALS') {
+
+                        sh """
+                            aws ecr get-login-password --region ${AWS_REGION} \
+                                | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                        """
+
+                        sh """
+                            aws ecr describe-repositories \
+                                --repository-names ${APP_NAME} \
+                                --region ${AWS_REGION} \
+                            || aws ecr create-repository \
+                                --repository-name ${APP_NAME} \
+                                --region ${AWS_REGION} \
+                                --image-scanning-configuration scanOnPush=true \
+                                --encryption-configuration encryptionType=AES256
+                        """
+
+                        // Push versioned tag and rolling :latest
+                        sh "docker push ${IMAGE_NAME}:${IMAGE_TAG}"
+                        sh "docker push ${IMAGE_NAME}:latest"
+                    }
+                }
+            }
+        }
+
+        // ── 7. DEPLOY TO EC2 ───
+        stage('Deploy to EC2') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    sshagent(credentials: ['EC2_SSH_KEY']) {
+                        sh """
+                            ssh -o StrictHostKeyChecking=no ec2-user@${EC2_HOST} '
+                                # EC2 IAM role must allow ecr:GetAuthorizationToken + ecr:BatchGetImage
+                                aws ecr get-login-password --region ${AWS_REGION} \
+                                    | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                                docker pull ${IMAGE_NAME}:${IMAGE_TAG}
+                                docker stop ${APP_NAME} || true
+                                docker rm   ${APP_NAME} || true
+                                docker run -d \\
+                                    --name ${APP_NAME} \\
+                                    --restart unless-stopped \\
+                                    -p 8080:8080 \\
+                                    -e SPRING_PROFILES_ACTIVE=prod \\
+                                    ${IMAGE_NAME}:${IMAGE_TAG}
+                                docker image prune -f
+                            '
+                        """
+                    }
+                }
+            }
+        }
+
+        // ── 8. SMOKE TEST ──────
+        stage('Smoke Test') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    retry(5) {
+                        sleep(10)
+                        sh "curl -f http://${EC2_HOST}:8080/health"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline succeeded — ${IMAGE_NAME}:${IMAGE_TAG} is live."
+        }
+        failure {
+            echo "Pipeline FAILED for build ${env.BUILD_NUMBER}."
+        }
+        always {
+            sh "docker logout ${ECR_REGISTRY} || true"
+            cleanWs()
+        }
+    }
+}

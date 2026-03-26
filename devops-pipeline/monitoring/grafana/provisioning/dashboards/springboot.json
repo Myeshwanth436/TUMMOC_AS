@@ -1,0 +1,50 @@
+{
+  "title": "Spring Boot Metrics",
+  "uid": "springboot-devops",
+  "version": 1,
+  "schemaVersion": 36,
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP Requests / sec",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "rate(http_server_requests_seconds_count[1m])",
+        "legendFormat": "req/s"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "JVM Heap Used (MB)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [{
+        "expr": "jvm_memory_used_bytes{area='heap'} / 1024 / 1024",
+        "legendFormat": "Heap MB"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "HTTP Error Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [{
+        "expr": "rate(http_server_requests_seconds_count{status=~'5..'}[1m])",
+        "legendFormat": "errors/s"
+      }]
+    },
+    {
+      "id": 4,
+      "title": "Response Time (p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(http_server_requests_seconds_bucket[5m]))",
+        "legendFormat": "p99 latency"
+      }]
+    }
+  ],
+  "time": { "from": "now-1h", "to": "now" },
+  "refresh": "30s"
+}
